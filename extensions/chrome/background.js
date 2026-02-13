@@ -52,20 +52,15 @@ function buildRules(domainsList) {
     const rule = {
       id: id++,
       priority: 1,
-      action: { type: "block" },
+      action: { 
+        type: "redirect",
+        redirect: { 
+          extensionPath: "/blocked.html?url=" + encodeURIComponent(host)
+        }
+      },
       condition: {
         urlFilter: `||${host}`,
-        resourceTypes: [
-          "main_frame",
-          "sub_frame",
-          "xmlhttprequest",
-          "script",
-          "image",
-          "stylesheet",
-          "font",
-          "media",
-          "object"
-        ]
+        resourceTypes: ["main_frame"]  // Only redirect main page loads, not subresources
       }
     };
     log("Built rule:", JSON.stringify(rule));
