@@ -23,6 +23,7 @@ from .websocket_server import LocalWebSocketServer
 
 class UiSignals(QObject):
     ble_status_changed = pyqtSignal(str)
+    ble_devices_changed = pyqtSignal(list)
 
 
 class MainWindow(QWidget):
@@ -32,7 +33,11 @@ class MainWindow(QWidget):
         self._store = BlocklistStore()
         self._signals = UiSignals()
         self._signals.ble_status_changed.connect(self._set_ble_status)
-        self._server = LocalWebSocketServer(on_ble_status=self._signals.ble_status_changed.emit)
+        self._signals.ble_devices_changed.connect(self._set_ble_devices)
+        self._server = LocalWebSocketServer(
+            on_ble_status=self._signals.ble_status_changed.emit,
+            on_ble_devices=self._signals.ble_devices_changed.emit,
+        )
         self._server_thread = threading.Thread(target=self._server.run_forever, daemon=True)
         self._server_thread.start()
         self._blocking_checkbox = QCheckBox("Blocking enabled")
@@ -48,6 +53,9 @@ class MainWindow(QWidget):
         self._remove_button.clicked.connect(self._remove_selected)
 
         self._ble_status = QLabel("BLE: starting")
+        self._ble_devices = QListWidget()
+        self._ble_devices.setMinimumHeight(120)
+        self._ble_devices_label = QLabel("Nearby BLE devices")
 
         input_row = QHBoxLayout()
         input_row.addWidget(self._domain_input)
@@ -59,6 +67,8 @@ class MainWindow(QWidget):
         layout.addWidget(self._list)
         layout.addWidget(self._remove_button)
         layout.addWidget(self._ble_status)
+        layout.addWidget(self._ble_devices_label)
+        layout.addWidget(self._ble_devices)
 
         self.setLayout(layout)
         self._load_state()
@@ -71,7 +81,7 @@ class MainWindow(QWidget):
             self._list.addItem(QListWidgetItem(domain))
 
     def _on_blocking_changed(self, state: int) -> None:
-        blocking = state == Qt.CheckState.Checked
+        blocking = state == Qt.CheckState.Checked.value
         self._store.set_blocking(blocking)
 
     def _add_domain(self) -> None:
@@ -101,6 +111,11 @@ class MainWindow(QWidget):
 
     def _set_ble_status(self, status: str) -> None:
         self._ble_status.setText(status)
+
+    def _set_ble_devices(self, devices: List[str]) -> None:
+        self._ble_devices.clear()
+        for name in devices:
+            self._ble_devices.addItem(QListWidgetItem(name))
 
 
 def main() -> None:

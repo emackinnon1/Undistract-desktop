@@ -3,23 +3,36 @@ from __future__ import annotations
 import json
 import struct
 import sys
+import threading
+import time
+from pathlib import Path
 from typing import Optional
 
-from .blocklist_store import BlocklistStore
+from .blocklist_store import BlocklistStore, STATE_FILE
 
 
 class NativeHost:
     def __init__(self) -> None:
         self.store = BlocklistStore()
+        self._last_version = self.store.load().version
+        self._stop_event = threading.Event()
+        self._watcher_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
+        # Start file watcher in background thread
+        self._watcher_thread = threading.Thread(target=self._watch_state_file, daemon=True)
+        self._watcher_thread.start()
+        
+        # Main message loop
         while True:
             raw_length = sys.stdin.buffer.read(4)
             if not raw_length:
+                self._stop_event.set()
                 break
             message_length = struct.unpack("<I", raw_length)[0]
             raw_message = sys.stdin.buffer.read(message_length)
             if not raw_message:
+                self._stop_event.set()
                 break
             try:
                 msg = json.loads(raw_message.decode("utf-8"))
@@ -27,6 +40,19 @@ class NativeHost:
                 self._send({"type": "error", "message": "invalid_json"})
                 continue
             self._handle(msg)
+
+    def _watch_state_file(self) -> None:
+        """Poll the state file and push updates when version changes."""
+        while not self._stop_event.is_set():
+            time.sleep(0.5)  # Check every 500ms
+            try:
+                state = self.store.load()
+                if state.version != self._last_version:
+                    self._last_version = state.version
+                    self._send(self._state_payload(state))
+            except Exception:
+                # Ignore read errors, keep watching
+                pass
 
     def _handle(self, msg: dict) -> None:
         msg_type = msg.get("type")

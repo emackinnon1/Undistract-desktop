@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -29,12 +29,14 @@ class BleToggleClient:
         char_uuid: str = DEFAULT_BLE_CHAR_UUID,
         device_name: Optional[str] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        on_devices: Optional[Callable[[List[str]], None]] = None,
     ) -> None:
         self._on_toggle = on_toggle
         self._service_uuid = service_uuid.lower()
         self._char_uuid = char_uuid
         self._device_name = device_name
         self._on_status = on_status
+        self._on_devices = on_devices
         self._stop_event = asyncio.Event()
 
     async def stop(self) -> None:
@@ -61,6 +63,7 @@ class BleToggleClient:
 
     async def _discover_device(self):
         devices = await BleakScanner.discover(timeout=4.0)
+        self._emit_devices(devices)
         for d in devices:
             if self._device_name and d.name != self._device_name:
                 continue
@@ -68,6 +71,17 @@ class BleToggleClient:
             if self._service_uuid in service_uuids:
                 return d
         return None
+
+    def _emit_devices(self, devices) -> None:
+        if self._on_devices is None:
+            return
+        names = []
+        for d in devices:
+            label = d.name or d.address
+            if d.rssi is not None:
+                label = f"{label} (RSSI {d.rssi})"
+            names.append(label)
+        self._on_devices(names)
 
     def _handle_notification(self, _sender, data: bytearray) -> None:
         blocking = self._parse_payload(data)
@@ -105,6 +119,7 @@ class LocalWebSocketServer:
         ble_char_uuid: str = DEFAULT_BLE_CHAR_UUID,
         ble_device_name: Optional[str] = None,
         on_ble_status: Optional[Callable[[str], None]] = None,
+        on_ble_devices: Optional[Callable[[List[str]], None]] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -121,6 +136,7 @@ class LocalWebSocketServer:
                 char_uuid=ble_char_uuid,
                 device_name=ble_device_name,
                 on_status=on_ble_status,
+                on_devices=on_ble_devices,
             )
 
     async def _handler(self, ws: WebSocketServerProtocol) -> None:
