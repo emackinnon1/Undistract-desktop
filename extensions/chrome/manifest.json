@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Undistract Blocker (Prototype)",
+  "version": "0.1.0",
+  "description": "Blocks domains using a local desktop companion.",
+  "permissions": ["declarativeNetRequest", "declarativeNetRequestFeedback", "storage", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

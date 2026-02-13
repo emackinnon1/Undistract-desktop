@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "Undistract Blocker (Prototype)",
+  "version": "0.1.0",
+  "description": "Blocks domains using a local desktop companion.",
+  "permissions": ["webRequest", "webRequestBlocking", "<all_urls>", "storage", "nativeMessaging"],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "undistract@local"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  }
+}

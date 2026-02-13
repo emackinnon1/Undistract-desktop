@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python -m undistract_desktop.native_host

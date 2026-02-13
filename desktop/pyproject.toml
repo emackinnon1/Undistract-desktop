@@ -1,0 +1,22 @@
+[project]
+name = "undistract-desktop"
+version = "0.1.0"
+description = "Browser-only website blocker desktop companion"
+readme = "../README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt6>=6.6",
+  "websockets>=12.0",
+  "bleak>=0.22.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+undistract = "undistract_desktop.app:main"
+undistract-native-host = "undistract_desktop.native_host:main"
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
