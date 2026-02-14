@@ -33,6 +33,7 @@ class BleToggleClient:
         device_name: Optional[str] = None,
         on_status: Optional[Callable[[str], None]] = None,
         on_devices: Optional[Callable[[List[str]], None]] = None,
+        on_connected: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self._on_toggle = on_toggle
         self._service_uuid = service_uuid.lower()
@@ -40,6 +41,7 @@ class BleToggleClient:
         self._device_name = device_name
         self._on_status = on_status
         self._on_devices = on_devices
+        self._on_connected = on_connected
         self._stop_event = asyncio.Event()
 
     async def stop(self) -> None:
@@ -63,13 +65,27 @@ class BleToggleClient:
                     logger.info(f"Successfully connected to {device.name or device.address}")
                     logger.info(f"Subscribing to characteristic {self._char_uuid}")
                     self._emit_status("BLE: connected")
+                    self._emit_connected(True)
                     await client.start_notify(self._char_uuid, self._handle_notification)
                     logger.info("Subscribed to notifications")
+                    
+                    # Read the initial blocking state
+                    try:
+                        initial_value = await client.read_gatt_char(self._char_uuid)
+                        logger.info(f"Read initial characteristic value: {initial_value.hex()}")
+                        initial_blocking = self._parse_payload(initial_value)
+                        if initial_blocking is not None:
+                            logger.info(f"Initial blocking state: {initial_blocking}")
+                            await self._on_toggle(initial_blocking)
+                    except Exception as e:
+                        logger.warning(f"Failed to read initial characteristic value: {e}")
+                    
                     while client.is_connected and not self._stop_event.is_set():
                         await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"BLE connection error: {e}", exc_info=True)
                 self._emit_status("BLE: disconnected")
+                self._emit_connected(False)
                 await asyncio.sleep(2)
 
     async def _discover_device(self):
@@ -131,6 +147,10 @@ class BleToggleClient:
         if self._on_status is not None:
             self._on_status(status)
 
+    def _emit_connected(self, connected: bool) -> None:
+        if self._on_connected is not None:
+            self._on_connected(connected)
+
     @staticmethod
     def _parse_payload(data: bytearray) -> Optional[bool]:
         if not data:
@@ -166,6 +186,8 @@ class LocalWebSocketServer:
         ble_device_name: Optional[str] = None,
         on_ble_status: Optional[Callable[[str], None]] = None,
         on_ble_devices: Optional[Callable[[List[str]], None]] = None,
+        on_ble_connected: Optional[Callable[[bool], None]] = None,
+        on_blocking_changed: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -175,6 +197,7 @@ class LocalWebSocketServer:
         self._store = BlocklistStore()
         self._ble_task: Optional[asyncio.Task] = None
         self._ble_client = None
+        self._on_blocking_changed = on_blocking_changed
         if enable_ble:
             self._ble_client = BleToggleClient(
                 self._handle_ble_toggle,
@@ -183,6 +206,7 @@ class LocalWebSocketServer:
                 device_name=ble_device_name,
                 on_status=on_ble_status,
                 on_devices=on_ble_devices,
+                on_connected=on_ble_connected,
             )
 
     async def _handler(self, ws: WebSocketServerProtocol) -> None:
@@ -223,8 +247,11 @@ class LocalWebSocketServer:
             await ws.send(json.dumps({"type": "error", "message": "unknown_message"}))
 
     async def _handle_ble_toggle(self, blocking: bool) -> None:
+        logger.info(f"BLE toggled blocking state to: {blocking}")
         state = self._store.set_blocking(blocking)
         await self._broadcast(self._state_payload(state))
+        if self._on_blocking_changed is not None:
+            self._on_blocking_changed(blocking)
 
     def _state_payload(self, state=None) -> dict:
         if state is None:

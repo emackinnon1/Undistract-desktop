@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class UiSignals(QObject):
     ble_status_changed = pyqtSignal(str)
     ble_devices_changed = pyqtSignal(list)
+    blocking_changed = pyqtSignal(bool)
 
 
 class MainWindow(QWidget):
@@ -37,9 +38,11 @@ class MainWindow(QWidget):
         self._signals = UiSignals()
         self._signals.ble_status_changed.connect(self._set_ble_status)
         self._signals.ble_devices_changed.connect(self._set_ble_devices)
+        self._signals.blocking_changed.connect(self._set_blocking_state)
         self._server = LocalWebSocketServer(
             on_ble_status=self._signals.ble_status_changed.emit,
             on_ble_devices=self._signals.ble_devices_changed.emit,
+            on_blocking_changed=self._signals.blocking_changed.emit,
         )
         self._server_thread = threading.Thread(target=self._server.run_forever, daemon=True)
         self._server_thread.start()
@@ -119,6 +122,17 @@ class MainWindow(QWidget):
         self._ble_devices.clear()
         for name in devices:
             self._ble_devices.addItem(QListWidgetItem(name))
+
+    def _set_blocking_state(self, blocking: bool) -> None:
+        """Update the checkbox state from BLE without triggering the change handler.
+        Enable checkbox when blocking=false, disable when blocking=true (phone in control)."""
+        # Temporarily disconnect to avoid triggering _on_blocking_changed
+        self._blocking_checkbox.stateChanged.disconnect(self._on_blocking_changed)
+        self._blocking_checkbox.setChecked(blocking)
+        # Disable checkbox when phone is actively blocking, enable when not
+        self._blocking_checkbox.setEnabled(not blocking)
+        self._blocking_checkbox.stateChanged.connect(self._on_blocking_changed)
+        logger.info(f"Blocking state updated from BLE: {blocking}, checkbox {'disabled' if blocking else 'enabled'}")
 
 
 def main() -> None:
