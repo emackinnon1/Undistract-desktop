@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
@@ -10,6 +11,8 @@ from websockets.server import WebSocketServerProtocol
 
 from .blocklist_store import BlocklistStore
 from bleak import BleakClient, BleakScanner
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_BLE_SERVICE_UUID = "a4f7e000-0000-1000-8000-00805f9b34fb"
@@ -43,50 +46,85 @@ class BleToggleClient:
         self._stop_event.set()
 
     async def run(self) -> None:
+        logger.info("BLE client starting")
         while not self._stop_event.is_set():
+            logger.info("Starting BLE device scan")
             self._emit_status("BLE: scanning")
             device = await self._discover_device()
             if device is None:
+                logger.warning("No matching BLE device found")
                 self._emit_status("BLE: not found")
                 await asyncio.sleep(2)
                 continue
             try:
+                logger.info(f"Attempting to connect to BLE device: {device.name or device.address}")
                 self._emit_status(f"BLE: connecting to {device.name or device.address}")
                 async with BleakClient(device) as client:
+                    logger.info(f"Successfully connected to {device.name or device.address}")
+                    logger.info(f"Subscribing to characteristic {self._char_uuid}")
                     self._emit_status("BLE: connected")
                     await client.start_notify(self._char_uuid, self._handle_notification)
+                    logger.info("Subscribed to notifications")
                     while client.is_connected and not self._stop_event.is_set():
                         await asyncio.sleep(1)
-            except Exception:
+            except Exception as e:
+                logger.error(f"BLE connection error: {e}", exc_info=True)
                 self._emit_status("BLE: disconnected")
                 await asyncio.sleep(2)
 
     async def _discover_device(self):
-        devices = await BleakScanner.discover(timeout=4.0)
-        self._emit_devices(devices)
-        for d in devices:
-            if self._device_name and d.name != self._device_name:
+        logger.info("Discovering BLE devices...")
+        discovery = await BleakScanner.discover(timeout=4.0, return_adv=True)
+        logger.info(f"Found {len(discovery)} BLE devices")
+
+        for i, (address, (device, adv)) in enumerate(discovery.items()):
+            name = adv.local_name or device.name or "Unknown"
+            service_uuids = [u.lower() for u in adv.service_uuids]
+            logger.info(
+                f"  Device {i+1}/{len(discovery)}: {name} ({address}), "
+                f"RSSI: {adv.rssi}, Service UUIDs: {service_uuids}"
+            )
+
+        self._emit_devices(list(discovery.values()))
+
+        for address, (device, adv) in discovery.items():
+            name = adv.local_name or device.name
+            if self._device_name and name != self._device_name:
+                logger.debug(f"Skipping device {name or address} (name mismatch)")
                 continue
-            service_uuids = [s.lower() for s in (d.metadata.get("uuids") or [])]
+            service_uuids = [u.lower() for u in adv.service_uuids]
             if self._service_uuid in service_uuids:
-                return d
+                logger.info(
+                    f"Found matching device: {name or address} "
+                    f"with service UUID {self._service_uuid}"
+                )
+                return device
+
+        logger.warning(f"No device found advertising service UUID {self._service_uuid}")
         return None
 
-    def _emit_devices(self, devices) -> None:
+    def _emit_devices(self, device_adv_pairs) -> None:
         if self._on_devices is None:
+            logger.debug("No on_devices callback registered")
             return
         names = []
-        for d in devices:
-            label = d.name or d.address
-            if d.rssi is not None:
-                label = f"{label} (RSSI {d.rssi})"
+        for device, adv in device_adv_pairs:
+            label = adv.local_name or device.name or device.address
+            if adv.rssi is not None:
+                label = f"{label} (RSSI {adv.rssi})"
+            if adv.service_uuids:
+                label = f"{label}  services: {adv.service_uuids}"
             names.append(label)
+        logger.info(f"Emitting {len(names)} devices to callback")
         self._on_devices(names)
 
     def _handle_notification(self, _sender, data: bytearray) -> None:
+        logger.info(f"Received BLE notification: {data.hex()}")
         blocking = self._parse_payload(data)
         if blocking is None:
+            logger.warning(f"Could not parse notification payload: {data}")
             return
+        logger.info(f"Parsed blocking state: {blocking}")
         asyncio.create_task(self._on_toggle(blocking))
 
     def _emit_status(self, status: str) -> None:
@@ -96,15 +134,23 @@ class BleToggleClient:
     @staticmethod
     def _parse_payload(data: bytearray) -> Optional[bool]:
         if not data:
+            logger.debug("Empty payload received")
             return None
         if len(data) == 1:
-            return bool(data[0])
+            result = bool(data[0])
+            logger.debug(f"Single byte payload: {data[0]} -> {result}")
+            return result
         try:
             payload = json.loads(data.decode("utf-8"))
-        except Exception:
+            logger.debug(f"JSON payload: {payload}")
+        except Exception as e:
+            logger.warning(f"Failed to parse JSON payload: {e}")
             return None
         if isinstance(payload, dict) and "blocking" in payload:
-            return bool(payload.get("blocking"))
+            result = bool(payload.get("blocking"))
+            logger.debug(f"Extracted blocking state from JSON: {result}")
+            return result
+        logger.debug("No blocking field in payload")
         return None
 
 

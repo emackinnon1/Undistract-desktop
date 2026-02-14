@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from typing import List
 
@@ -20,7 +21,9 @@ from PyQt6.QtWidgets import (
 from .blocklist_store import BlocklistStore
 from .websocket_server import LocalWebSocketServer
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+logger = logging.getLogger(__name__)
 class UiSignals(QObject):
     ble_status_changed = pyqtSignal(str)
     ble_devices_changed = pyqtSignal(list)
