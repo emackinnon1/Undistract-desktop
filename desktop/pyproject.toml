@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2"]
+dev = ["pytest>=8.2", "pyinstaller>=6.0"]
 
 [project.scripts]
 undistract = "undistract_desktop.app:main"
@@ -20,3 +20,8 @@ undistract-native-host = "undistract_desktop.native_host:main"
 [build-system]
 requires = ["hatchling>=1.24.0"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pillow>=12.1.1",
+]
