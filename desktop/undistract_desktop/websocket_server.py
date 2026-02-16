@@ -56,7 +56,7 @@ class BleToggleClient:
             if device is None:
                 logger.warning("No matching BLE device found")
                 self._emit_status("BLE: not found")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
             try:
                 logger.info(f"Attempting to connect to BLE device: {device.name or device.address}")
@@ -80,13 +80,37 @@ class BleToggleClient:
                     except Exception as e:
                         logger.warning(f"Failed to read initial characteristic value: {e}")
                     
+                    # Periodic health check to detect stale connections (e.g., after sleep)
+                    health_check_interval = 30  # seconds
+                    last_health_check = asyncio.get_event_loop().time()
+                    
                     while client.is_connected and not self._stop_event.is_set():
                         await asyncio.sleep(1)
+                        
+                        # Perform periodic health check by reading the characteristic
+                        current_time = asyncio.get_event_loop().time()
+                        if current_time - last_health_check >= health_check_interval:
+                            try:
+                                logger.debug("Performing BLE connection health check")
+                                # Try to read with a timeout to detect stale connections
+                                value = await asyncio.wait_for(
+                                    client.read_gatt_char(self._char_uuid),
+                                    timeout=5.0
+                                )
+                                logger.debug(f"Health check successful, value: {value.hex()}")
+                                last_health_check = current_time
+                            except asyncio.TimeoutError:
+                                logger.warning("Health check timed out, connection may be stale")
+                                raise  # This will cause reconnection
+                            except Exception as e:
+                                logger.warning(f"Health check failed: {e}")
+                                raise  # This will cause reconnection
             except Exception as e:
                 logger.error(f"BLE connection error: {e}", exc_info=True)
                 self._emit_status("BLE: disconnected")
                 self._emit_connected(False)
-                await asyncio.sleep(2)
+                # Shorter retry delay for faster recovery after sleep/wake
+                await asyncio.sleep(1)
 
     async def _discover_device(self):
         logger.info("Discovering BLE devices...")
