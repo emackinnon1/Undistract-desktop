@@ -1,11 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
+# Get the project root directory (one level up from this spec file)
+spec_root = os.path.abspath(os.path.dirname(SPECPATH))
+project_root = os.path.dirname(spec_root)
+icon_path = os.path.join(project_root, 'Undistract-logo.png')
 
 a = Analysis(
     ['run_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('/Users/elliotmackinnon/Projects/Undistract-desktop/Undistract-logo.png', '.')],
+    datas=[(icon_path, '.')],
     hiddenimports=['undistract_desktop.blocklist_store', 'undistract_desktop.websocket_server'],
     hookspath=[],
     hooksconfig={},
@@ -32,7 +38,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/Users/elliotmackinnon/Projects/Undistract-desktop/Undistract-logo.png'],
+    icon=[icon_path],
 )
 coll = COLLECT(
     exe,
@@ -46,7 +52,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Undistract.app',
-    icon='/Users/elliotmackinnon/Projects/Undistract-desktop/Undistract-logo.png',
+    icon=icon_path,
     bundle_identifier='com.undistract.desktop',
     info_plist={
         'NSBluetoothAlwaysUsageDescription': 'Undistract uses Bluetooth to connect to your blocking device to enforce website blocking.',
