@@ -13,18 +13,18 @@ Browser-only website blocker companion app for macOS.
 ```bash
 uv sync --project desktop --extra dev
 ```
-This creates `desktop/.venv` with all dependencies including `py2app` for building the macOS app bundle.
+This creates `desktop/.venv` with all dependencies including `pyinstaller` for building the macOS app bundle.
 
 ### 2. Build the macOS application
 ```bash
 installer/build_app.sh
 ```
 This will:
-- Build `Undistract.app` using py2app
+- Build `Undistract.app` using PyInstaller
 - Optionally install it to `/Applications/`
-- Create a proper macOS app with icon, name, and bundle identifier
+- Create a proper macOS app with icon, name, bundle identifier, and required privacy permissions
 
-**Note:** If you encounter py2app build issues, you can run the app directly from the terminal for development:
+**Note:** You can run the app directly from the terminal for development:
 ```bash
 uv run --project desktop undistract
 ```

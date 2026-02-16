@@ -25,19 +25,11 @@ fi
 # Clean previous builds
 rm -rf "$DESKTOP_DIR/build" "$DESKTOP_DIR/dist"
 
-# Build the .app bundle
+# Build the .app bundle using the spec file (preserves info_plist, dynamic paths, etc.)
 echo "Running PyInstaller..."
 "$DESKTOP_DIR/.venv/bin/pyinstaller" \
-  --name="Undistract" \
-  --windowed \
-  --icon="$ICON_PATH" \
-  --add-data="$ICON_PATH:." \
-  --osx-bundle-identifier="com.undistract.desktop" \
-  --hidden-import=undistract_desktop.blocklist_store \
-  --hidden-import=undistract_desktop.websocket_server \
-  --clean \
   --noconfirm \
-  run_app.py
+  Undistract.spec
 
 if [[ ! -d "$DESKTOP_DIR/dist/Undistract.app" ]]; then
   echo "ERROR: Build failed - Undistract.app not found"

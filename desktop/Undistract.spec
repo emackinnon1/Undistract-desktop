@@ -2,9 +2,9 @@
 
 import os
 
-# Get the project root directory (one level up from this spec file)
-spec_root = os.path.abspath(os.path.dirname(SPECPATH))
-project_root = os.path.dirname(spec_root)
+# SPECPATH is the directory containing this spec file (i.e. desktop/)
+# Project root is one level up from that
+project_root = os.path.dirname(SPECPATH)
 icon_path = os.path.join(project_root, 'Undistract-logo.png')
 
 a = Analysis(
