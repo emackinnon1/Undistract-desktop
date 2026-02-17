@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import platform
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
@@ -11,6 +12,20 @@ from websockets.server import WebSocketServerProtocol
 
 from .blocklist_store import BlocklistStore
 from bleak import BleakClient, BleakScanner
+
+# macOS sleep/wake event handling
+if platform.system() == "Darwin":
+    try:
+        from Foundation import NSObject, NSWorkspace
+        from Cocoa import (
+            NSWorkspaceWillSleepNotification,
+            NSWorkspaceDidWakeNotification,
+        )
+        MACOS_SLEEP_WAKE_AVAILABLE = True
+    except ImportError:
+        MACOS_SLEEP_WAKE_AVAILABLE = False
+else:
+    MACOS_SLEEP_WAKE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +58,61 @@ class BleToggleClient:
         self._on_devices = on_devices
         self._on_connected = on_connected
         self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
+        self._sleep_wake_observer = None
+        
+        # Set up macOS sleep/wake notifications
+        if MACOS_SLEEP_WAKE_AVAILABLE:
+            self._setup_sleep_wake_observer()
 
+    def _setup_sleep_wake_observer(self) -> None:
+        """Set up macOS sleep/wake event observer."""
+        try:
+            class SleepWakeObserver(NSObject):
+                def init_with_client(self, client):
+                    self = self.init()
+                    if self:
+                        self.client = client
+                    return self
+                
+                def computer_will_sleep_(self, notification):
+                    logger.info("macOS: Computer going to sleep")
+                    # No async action needed here, just log
+                
+                def computer_did_wake_(self, notification):
+                    logger.info("macOS: Computer woke from sleep")
+                    # Signal the BLE client to force reconnection
+                    self.client._wake_event.set()
+            
+            self._sleep_wake_observer = SleepWakeObserver.alloc().init_with_client(self)
+            workspace = NSWorkspace.sharedWorkspace()
+            nc = workspace.notificationCenter()
+            
+            nc.addObserver_selector_name_object_(
+                self._sleep_wake_observer,
+                "computer_will_sleep:",
+                NSWorkspaceWillSleepNotification,
+                None
+            )
+            nc.addObserver_selector_name_object_(
+                self._sleep_wake_observer,
+                "computer_did_wake:",
+                NSWorkspaceDidWakeNotification,
+                None
+            )
+            logger.info("macOS sleep/wake observer registered")
+        except Exception as e:
+            logger.warning(f"Failed to set up sleep/wake observer: {e}")
+    
     async def stop(self) -> None:
         self._stop_event.set()
+        if MACOS_SLEEP_WAKE_AVAILABLE and self._sleep_wake_observer:
+            try:
+                workspace = NSWorkspace.sharedWorkspace()
+                nc = workspace.notificationCenter()
+                nc.removeObserver_(self._sleep_wake_observer)
+            except Exception as e:
+                logger.warning(f"Failed to remove sleep/wake observer: {e}")
 
     async def run(self) -> None:
         logger.info("BLE client starting")
@@ -81,10 +148,16 @@ class BleToggleClient:
                         logger.warning(f"Failed to read initial characteristic value: {e}")
                     
                     # Periodic health check to detect stale connections (e.g., after sleep)
-                    health_check_interval = 30  # seconds
+                    health_check_interval = 10  # seconds (reduced for faster detection)
                     last_health_check = asyncio.get_event_loop().time()
                     
                     while client.is_connected and not self._stop_event.is_set():
+                        # Check if system just woke up
+                        if self._wake_event.is_set():
+                            logger.info("Wake event detected, forcing reconnection")
+                            self._wake_event.clear()
+                            raise Exception("System wake - forcing reconnection")
+                        
                         await asyncio.sleep(1)
                         
                         # Perform periodic health check by reading the characteristic
