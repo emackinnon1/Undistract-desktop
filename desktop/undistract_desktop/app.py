@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import threading
 from pathlib import Path
 from typing import List
@@ -25,7 +26,23 @@ from PyQt6.QtWidgets import (
 from .blocklist_store import BlocklistStore
 from .websocket_server import LocalWebSocketServer
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Set up logging to file so we can diagnose issues in the bundled app
+_log_dir = Path.home() / "Library" / "Logs" / "Undistract"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_log_file = _log_dir / "undistract.log"
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    _log_file, maxBytes=2 * 1024 * 1024, backupCount=3,
+)
+_file_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), _file_handler],
+)
 
 logger = logging.getLogger(__name__)
 class UiSignals(QObject):

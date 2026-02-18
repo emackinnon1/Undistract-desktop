@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import platform
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
@@ -12,20 +12,6 @@ from websockets.server import WebSocketServerProtocol
 
 from .blocklist_store import BlocklistStore
 from bleak import BleakClient, BleakScanner
-
-# macOS sleep/wake event handling
-if platform.system() == "Darwin":
-    try:
-        from Foundation import NSObject, NSWorkspace
-        from Cocoa import (
-            NSWorkspaceWillSleepNotification,
-            NSWorkspaceDidWakeNotification,
-        )
-        MACOS_SLEEP_WAKE_AVAILABLE = True
-    except ImportError:
-        MACOS_SLEEP_WAKE_AVAILABLE = False
-else:
-    MACOS_SLEEP_WAKE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +26,31 @@ class ClientState:
 
 
 class BleToggleClient:
+    """BLE client that connects to the Undistract mobile app and syncs blocking state.
+    
+    Handles system sleep/wake by detecting wall-clock jumps and forcing
+    a full reconnection cycle (fresh scan → connect → read state).
+    """
+
+    # How long asyncio.sleep(1) can take in wall-clock time before we
+    # assume the system was asleep.  Must be large enough to avoid false
+    # positives from normal scheduling jitter.
+    SLEEP_DETECTION_SECS = 5
+
+    # How often (seconds) to perform a GATT read health-check while connected.
+    HEALTH_CHECK_INTERVAL_SECS = 10
+
+    # How long to wait for a single GATT read before declaring the
+    # connection dead.
+    GATT_READ_TIMEOUT_SECS = 5
+
+    # Seconds to wait after detecting a sleep/wake or disconnect before
+    # rescanning.  Gives CoreBluetooth time to re-initialise.
+    POST_WAKE_DELAY_SECS = 3
+
+    # Seconds to wait for BleakClient.disconnect() before giving up.
+    DISCONNECT_TIMEOUT_SECS = 5
+
     def __init__(
         self,
         on_toggle,
@@ -58,131 +69,144 @@ class BleToggleClient:
         self._on_devices = on_devices
         self._on_connected = on_connected
         self._stop_event = asyncio.Event()
-        self._wake_event = asyncio.Event()
-        self._sleep_wake_observer = None
-        
-        # Set up macOS sleep/wake notifications
-        if MACOS_SLEEP_WAKE_AVAILABLE:
-            self._setup_sleep_wake_observer()
+        self._disconnected_event: Optional[asyncio.Event] = None
 
-    def _setup_sleep_wake_observer(self) -> None:
-        """Set up macOS sleep/wake event observer."""
-        try:
-            class SleepWakeObserver(NSObject):
-                def init_with_client(self, client):
-                    self = self.init()
-                    if self:
-                        self.client = client
-                    return self
-                
-                def computer_will_sleep_(self, notification):
-                    logger.info("macOS: Computer going to sleep")
-                    # No async action needed here, just log
-                
-                def computer_did_wake_(self, notification):
-                    logger.info("macOS: Computer woke from sleep")
-                    # Signal the BLE client to force reconnection
-                    self.client._wake_event.set()
-            
-            self._sleep_wake_observer = SleepWakeObserver.alloc().init_with_client(self)
-            workspace = NSWorkspace.sharedWorkspace()
-            nc = workspace.notificationCenter()
-            
-            nc.addObserver_selector_name_object_(
-                self._sleep_wake_observer,
-                "computer_will_sleep:",
-                NSWorkspaceWillSleepNotification,
-                None
-            )
-            nc.addObserver_selector_name_object_(
-                self._sleep_wake_observer,
-                "computer_did_wake:",
-                NSWorkspaceDidWakeNotification,
-                None
-            )
-            logger.info("macOS sleep/wake observer registered")
-        except Exception as e:
-            logger.warning(f"Failed to set up sleep/wake observer: {e}")
-    
     async def stop(self) -> None:
         self._stop_event.set()
-        if MACOS_SLEEP_WAKE_AVAILABLE and self._sleep_wake_observer:
-            try:
-                workspace = NSWorkspace.sharedWorkspace()
-                nc = workspace.notificationCenter()
-                nc.removeObserver_(self._sleep_wake_observer)
-            except Exception as e:
-                logger.warning(f"Failed to remove sleep/wake observer: {e}")
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def _on_ble_disconnected(self, client: BleakClient) -> None:
+        """Called by bleak when the peripheral disconnects (including sleep)."""
+        logger.warning("BLE disconnected callback fired")
+        if self._disconnected_event is not None:
+            self._disconnected_event.set()
+
+    async def _safe_disconnect(self, client: BleakClient) -> None:
+        """Disconnect with a timeout so we never hang."""
+        try:
+            if client.is_connected:
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=self.DISCONNECT_TIMEOUT_SECS
+                )
+        except Exception as e:
+            logger.warning(f"Error during BLE disconnect (ignored): {e}")
 
     async def run(self) -> None:
         logger.info("BLE client starting")
+        just_woke = False
+
         while not self._stop_event.is_set():
+            # After a detected sleep/wake, give CoreBluetooth time to recover.
+            if just_woke:
+                logger.info(
+                    f"Waiting {self.POST_WAKE_DELAY_SECS}s for Bluetooth stack to recover"
+                )
+                self._emit_status("BLE: waiting for Bluetooth")
+                await asyncio.sleep(self.POST_WAKE_DELAY_SECS)
+                just_woke = False
+
+            # --- Discover ---
             logger.info("Starting BLE device scan")
             self._emit_status("BLE: scanning")
             device = await self._discover_device()
             if device is None:
                 logger.warning("No matching BLE device found")
                 self._emit_status("BLE: not found")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 continue
+
+            # --- Connect (without async-with so we control disconnect) ---
+            client = BleakClient(
+                device, disconnected_callback=self._on_ble_disconnected
+            )
+            self._disconnected_event = asyncio.Event()
+
             try:
-                logger.info(f"Attempting to connect to BLE device: {device.name or device.address}")
+                logger.info(f"Connecting to {device.name or device.address}")
                 self._emit_status(f"BLE: connecting to {device.name or device.address}")
-                async with BleakClient(device) as client:
-                    logger.info(f"Successfully connected to {device.name or device.address}")
-                    logger.info(f"Subscribing to characteristic {self._char_uuid}")
-                    self._emit_status("BLE: connected")
-                    self._emit_connected(True)
-                    await client.start_notify(self._char_uuid, self._handle_notification)
-                    logger.info("Subscribed to notifications")
-                    
-                    # Read the initial blocking state
-                    try:
-                        initial_value = await client.read_gatt_char(self._char_uuid)
-                        logger.info(f"Read initial characteristic value: {initial_value.hex()}")
-                        initial_blocking = self._parse_payload(initial_value)
-                        if initial_blocking is not None:
-                            logger.info(f"Initial blocking state: {initial_blocking}")
-                            await self._on_toggle(initial_blocking)
-                    except Exception as e:
-                        logger.warning(f"Failed to read initial characteristic value: {e}")
-                    
-                    # Periodic health check to detect stale connections (e.g., after sleep)
-                    health_check_interval = 10  # seconds (reduced for faster detection)
-                    last_health_check = asyncio.get_event_loop().time()
-                    
-                    while client.is_connected and not self._stop_event.is_set():
-                        # Check if system just woke up
-                        if self._wake_event.is_set():
-                            logger.info("Wake event detected, forcing reconnection")
-                            self._wake_event.clear()
-                            raise Exception("System wake - forcing reconnection")
-                        
-                        await asyncio.sleep(1)
-                        
-                        # Perform periodic health check by reading the characteristic
-                        current_time = asyncio.get_event_loop().time()
-                        if current_time - last_health_check >= health_check_interval:
-                            try:
-                                logger.debug("Performing BLE connection health check")
-                                # Try to read with a timeout to detect stale connections
-                                value = await asyncio.wait_for(
-                                    client.read_gatt_char(self._char_uuid),
-                                    timeout=5.0
-                                )
-                                logger.debug(f"Health check successful, value: {value.hex()}")
-                                last_health_check = current_time
-                            except asyncio.TimeoutError:
-                                logger.warning("Health check timed out, connection may be stale")
-                                raise  # This will cause reconnection
-                            except Exception as e:
-                                logger.warning(f"Health check failed: {e}")
-                                raise  # This will cause reconnection
+                await asyncio.wait_for(client.connect(), timeout=10.0)
+
+                logger.info(f"Connected to {device.name or device.address}")
+                self._emit_status("BLE: connected")
+                self._emit_connected(True)
+
+                # Subscribe to notifications
+                await client.start_notify(self._char_uuid, self._handle_notification)
+                logger.info("Subscribed to BLE notifications")
+
+                # Read the initial blocking state
+                try:
+                    initial_value = await asyncio.wait_for(
+                        client.read_gatt_char(self._char_uuid),
+                        timeout=self.GATT_READ_TIMEOUT_SECS,
+                    )
+                    logger.info(f"Initial characteristic value: {initial_value.hex()}")
+                    initial_blocking = self._parse_payload(initial_value)
+                    if initial_blocking is not None:
+                        logger.info(f"Initial blocking state: {initial_blocking}")
+                        await self._on_toggle(initial_blocking)
+                except Exception as e:
+                    logger.warning(f"Failed to read initial value: {e}")
+
+                # --- Stay-connected loop ---
+                last_health_check = time.time()
+
+                while not self._stop_event.is_set():
+                    # 1. Check bleak's disconnected callback
+                    if self._disconnected_event.is_set():
+                        logger.info("Disconnected event set, breaking connection loop")
+                        break
+
+                    # 2. Wall-clock sleep detection
+                    wall_before = time.time()
+                    await asyncio.sleep(1)
+                    wall_after = time.time()
+                    elapsed = wall_after - wall_before
+
+                    if elapsed > self.SLEEP_DETECTION_SECS:
+                        logger.info(
+                            f"System sleep detected (asyncio.sleep(1) took "
+                            f"{elapsed:.1f}s). Forcing reconnection."
+                        )
+                        just_woke = True
+                        break
+
+                    # 3. Check is_connected (may go False on its own)
+                    if not client.is_connected:
+                        logger.info("client.is_connected is False, breaking")
+                        break
+
+                    # 4. Periodic GATT read health-check + state sync
+                    if wall_after - last_health_check >= self.HEALTH_CHECK_INTERVAL_SECS:
+                        try:
+                            logger.debug("Health check: reading characteristic")
+                            value = await asyncio.wait_for(
+                                client.read_gatt_char(self._char_uuid),
+                                timeout=self.GATT_READ_TIMEOUT_SECS,
+                            )
+                            logger.debug(f"Health check OK: {value.hex()}")
+                            blocking = self._parse_payload(value)
+                            if blocking is not None:
+                                await self._on_toggle(blocking)
+                            last_health_check = wall_after
+                        except Exception as e:
+                            logger.warning(f"Health check failed: {e}")
+                            break
+
+            except asyncio.TimeoutError:
+                logger.error("BLE connect/setup timed out")
             except Exception as e:
                 logger.error(f"BLE connection error: {e}", exc_info=True)
+            finally:
+                await self._safe_disconnect(client)
                 self._emit_status("BLE: disconnected")
                 self._emit_connected(False)
-                # Shorter retry delay for faster recovery after sleep/wake
+                logger.info("BLE connection closed, will retry")
+
+            if not just_woke:
                 await asyncio.sleep(1)
 
     async def _discover_device(self):
@@ -295,6 +319,7 @@ class LocalWebSocketServer:
         self._ble_task: Optional[asyncio.Task] = None
         self._ble_client = None
         self._on_blocking_changed = on_blocking_changed
+        self._ble_controlled = False  # True when the phone activated blocking
         if enable_ble:
             self._ble_client = BleToggleClient(
                 self._handle_ble_toggle,
@@ -344,7 +369,19 @@ class LocalWebSocketServer:
             await ws.send(json.dumps({"type": "error", "message": "unknown_message"}))
 
     async def _handle_ble_toggle(self, blocking: bool) -> None:
-        logger.info(f"BLE toggled blocking state to: {blocking}")
+        logger.info(f"BLE reports blocking={blocking}, ble_controlled={self._ble_controlled}")
+
+        if blocking:
+            # Phone is activating blocking – always honour this.
+            self._ble_controlled = True
+        else:
+            # Phone says "not blocking".  Only release if the phone was the
+            # one that activated blocking; otherwise noop.
+            if not self._ble_controlled:
+                logger.info("BLE blocking=False ignored (phone did not set blocking)")
+                return
+            self._ble_controlled = False
+
         state = self._store.set_blocking(blocking)
         await self._broadcast(self._state_payload(state))
         if self._on_blocking_changed is not None:
