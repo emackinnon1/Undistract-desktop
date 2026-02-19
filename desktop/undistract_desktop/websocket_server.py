@@ -46,10 +46,19 @@ class BleToggleClient:
 
     # Seconds to wait after detecting a sleep/wake or disconnect before
     # rescanning.  Gives CoreBluetooth time to re-initialise.
-    POST_WAKE_DELAY_SECS = 3
+    POST_WAKE_DELAY_SECS = 5
 
     # Seconds to wait for BleakClient.disconnect() before giving up.
     DISCONNECT_TIMEOUT_SECS = 5
+
+    # Max consecutive connection failures before switching to long cooldown.
+    MAX_FAST_RETRIES = 3
+
+    # Long cooldown (seconds) after exhausting fast retries.
+    BACKOFF_COOLDOWN_SECS = 10
+
+    # Maximum backoff (seconds) between reconnection attempts.
+    MAX_BACKOFF_SECS = 30
 
     def __init__(
         self,
@@ -97,24 +106,66 @@ class BleToggleClient:
     async def run(self) -> None:
         logger.info("BLE client starting")
         just_woke = False
+        consecutive_failures = 0
 
         while not self._stop_event.is_set():
-            # After a detected sleep/wake, give CoreBluetooth time to recover.
+            # After a detected sleep/wake, give CoreBluetooth time to
+            # recover and reset the failure counter – stale failures from
+            # the pre-sleep session should not penalise post-wake retries.
             if just_woke:
                 logger.info(
-                    f"Waiting {self.POST_WAKE_DELAY_SECS}s for Bluetooth stack to recover"
+                    f"Post-wake recovery: resetting failure count "
+                    f"(was {consecutive_failures}), "
+                    f"waiting {self.POST_WAKE_DELAY_SECS}s for Bluetooth stack"
                 )
+                consecutive_failures = 0
                 self._emit_status("BLE: waiting for Bluetooth")
                 await asyncio.sleep(self.POST_WAKE_DELAY_SECS)
                 just_woke = False
 
-            # --- Discover ---
+            # Exponential backoff after repeated connection failures.
+            if consecutive_failures >= self.MAX_FAST_RETRIES:
+                cooldown = min(
+                    self.BACKOFF_COOLDOWN_SECS * (2 ** (consecutive_failures - self.MAX_FAST_RETRIES)),
+                    self.MAX_BACKOFF_SECS,
+                )
+                logger.warning(
+                    f"Connection failed {consecutive_failures} times in a row. "
+                    f"Waiting {cooldown:.0f}s before next attempt."
+                )
+                self._emit_status(f"BLE: retrying in {cooldown:.0f}s")
+                pre_backoff = time.time()
+                await asyncio.sleep(cooldown)
+                backoff_wall = time.time() - pre_backoff
+                if backoff_wall > cooldown + self.SLEEP_DETECTION_SECS:
+                    logger.info(
+                        f"Sleep detected during backoff "
+                        f"(wall {backoff_wall:.1f}s for {cooldown:.0f}s wait)"
+                    )
+                    just_woke = True
+                    continue
+
+            # --- Discover (use longer scan after failures) ---
             logger.info("Starting BLE device scan")
             self._emit_status("BLE: scanning")
-            device = await self._discover_device()
+            scan_timeout = 8.0 if consecutive_failures > 0 else 5.0
+            pre_scan = time.time()
+            device = await self._discover_device(scan_timeout=scan_timeout)
+            scan_wall = time.time() - pre_scan
+
+            # If the scan took far longer than expected, the system slept.
+            if scan_wall > scan_timeout + self.SLEEP_DETECTION_SECS:
+                logger.info(
+                    f"Sleep detected during scan "
+                    f"(wall {scan_wall:.1f}s for {scan_timeout}s scan)"
+                )
+                just_woke = True
+                continue
+
             if device is None:
                 logger.warning("No matching BLE device found")
                 self._emit_status("BLE: not found")
+                consecutive_failures += 1
                 await asyncio.sleep(2)
                 continue
 
@@ -123,6 +174,7 @@ class BleToggleClient:
                 device, disconnected_callback=self._on_ble_disconnected
             )
             self._disconnected_event = asyncio.Event()
+            pre_connect = time.time()
 
             try:
                 logger.info(f"Connecting to {device.name or device.address}")
@@ -132,6 +184,7 @@ class BleToggleClient:
                 logger.info(f"Connected to {device.name or device.address}")
                 self._emit_status("BLE: connected")
                 self._emit_connected(True)
+                consecutive_failures = 0  # Reset on successful connection
 
                 # Subscribe to notifications
                 await client.start_notify(self._char_uuid, self._handle_notification)
@@ -197,21 +250,45 @@ class BleToggleClient:
                             break
 
             except asyncio.TimeoutError:
-                logger.error("BLE connect/setup timed out")
+                connect_wall = time.time() - pre_connect
+                if connect_wall > 10 + self.SLEEP_DETECTION_SECS:
+                    logger.info(
+                        f"Sleep detected during connect "
+                        f"(wall {connect_wall:.1f}s for 10s timeout)"
+                    )
+                    just_woke = True
+                else:
+                    consecutive_failures += 1
+                    logger.error(
+                        f"BLE connect/setup timed out "
+                        f"(failure {consecutive_failures})"
+                    )
             except Exception as e:
-                logger.error(f"BLE connection error: {e}", exc_info=True)
+                connect_wall = time.time() - pre_connect
+                if connect_wall > 15:
+                    logger.info(
+                        f"Sleep likely occurred during connection error "
+                        f"(wall {connect_wall:.1f}s)"
+                    )
+                    just_woke = True
+                else:
+                    consecutive_failures += 1
+                    logger.error(
+                        f"BLE connection error (failure {consecutive_failures}): {e}",
+                        exc_info=True,
+                    )
             finally:
                 await self._safe_disconnect(client)
                 self._emit_status("BLE: disconnected")
                 self._emit_connected(False)
                 logger.info("BLE connection closed, will retry")
 
-            if not just_woke:
+            if not just_woke and consecutive_failures < self.MAX_FAST_RETRIES:
                 await asyncio.sleep(1)
 
-    async def _discover_device(self):
-        logger.info("Discovering BLE devices...")
-        discovery = await BleakScanner.discover(timeout=4.0, return_adv=True)
+    async def _discover_device(self, scan_timeout: float = 5.0):
+        logger.info(f"Discovering BLE devices (timeout={scan_timeout}s)...")
+        discovery = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
         logger.info(f"Found {len(discovery)} BLE devices")
 
         for i, (address, (device, adv)) in enumerate(discovery.items()):
