@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
+import multiprocessing as mp
+import multiprocessing.synchronize
+import queue
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
@@ -11,7 +13,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .blocklist_store import BlocklistStore
-from bleak import BleakClient, BleakScanner
+from .ble_worker import run_ble_worker
 
 logger = logging.getLogger(__name__)
 
@@ -26,39 +28,12 @@ class ClientState:
 
 
 class BleToggleClient:
-    """BLE client that connects to the Undistract mobile app and syncs blocking state.
-    
-    Handles system sleep/wake by detecting wall-clock jumps and forcing
-    a full reconnection cycle (fresh scan → connect → read state).
+    """Manages BLE connection to the mobile app via a child subprocess.
+
+    Running BLE in a separate process ensures each restart gets a
+    completely fresh CoreBluetooth context — the only reliable way to
+    recover from macOS sleep/wake BLE connection issues.
     """
-
-    # How long asyncio.sleep(1) can take in wall-clock time before we
-    # assume the system was asleep.  Must be large enough to avoid false
-    # positives from normal scheduling jitter.
-    SLEEP_DETECTION_SECS = 5
-
-    # How often (seconds) to perform a GATT read health-check while connected.
-    HEALTH_CHECK_INTERVAL_SECS = 10
-
-    # How long to wait for a single GATT read before declaring the
-    # connection dead.
-    GATT_READ_TIMEOUT_SECS = 5
-
-    # Seconds to wait after detecting a sleep/wake or disconnect before
-    # rescanning.  Gives CoreBluetooth time to re-initialise.
-    POST_WAKE_DELAY_SECS = 5
-
-    # Seconds to wait for BleakClient.disconnect() before giving up.
-    DISCONNECT_TIMEOUT_SECS = 5
-
-    # Max consecutive connection failures before switching to long cooldown.
-    MAX_FAST_RETRIES = 3
-
-    # Long cooldown (seconds) after exhausting fast retries.
-    BACKOFF_COOLDOWN_SECS = 10
-
-    # Maximum backoff (seconds) between reconnection attempts.
-    MAX_BACKOFF_SECS = 30
 
     def __init__(
         self,
@@ -78,268 +53,117 @@ class BleToggleClient:
         self._on_devices = on_devices
         self._on_connected = on_connected
         self._stop_event = asyncio.Event()
-        self._disconnected_event: Optional[asyncio.Event] = None
+        self._mp_stop: Optional[multiprocessing.synchronize.Event] = None
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if self._mp_stop is not None:
+            self._mp_stop.set()
 
     # ------------------------------------------------------------------
-    # Connection lifecycle
+    # Subprocess lifecycle
     # ------------------------------------------------------------------
-
-    def _on_ble_disconnected(self, client: BleakClient) -> None:
-        """Called by bleak when the peripheral disconnects (including sleep)."""
-        logger.warning("BLE disconnected callback fired")
-        if self._disconnected_event is not None:
-            self._disconnected_event.set()
-
-    async def _safe_disconnect(self, client: BleakClient) -> None:
-        """Disconnect with a timeout so we never hang."""
-        try:
-            if client.is_connected:
-                await asyncio.wait_for(
-                    client.disconnect(), timeout=self.DISCONNECT_TIMEOUT_SECS
-                )
-        except Exception as e:
-            logger.warning(f"Error during BLE disconnect (ignored): {e}")
 
     async def run(self) -> None:
-        logger.info("BLE client starting")
-        just_woke = False
-        consecutive_failures = 0
+        """Spawn and supervise a BLE worker subprocess.
+
+        When the subprocess exits (sleep detected, CoreBluetooth stuck,
+        or normal disconnect), a fresh subprocess is spawned — giving it
+        a clean CoreBluetooth context identical to an app restart.
+        """
+        logger.info("BLE client starting (subprocess mode)")
 
         while not self._stop_event.is_set():
-            # After a detected sleep/wake, give CoreBluetooth time to
-            # recover and reset the failure counter – stale failures from
-            # the pre-sleep session should not penalise post-wake retries.
-            if just_woke:
-                logger.info(
-                    f"Post-wake recovery: resetting failure count "
-                    f"(was {consecutive_failures}), "
-                    f"waiting {self.POST_WAKE_DELAY_SECS}s for Bluetooth stack"
-                )
-                consecutive_failures = 0
-                self._emit_status("BLE: waiting for Bluetooth")
-                await asyncio.sleep(self.POST_WAKE_DELAY_SECS)
-                just_woke = False
+            event_queue: mp.Queue = mp.Queue()
+            mp_stop = mp.Event()
+            self._mp_stop = mp_stop
 
-            # Exponential backoff after repeated connection failures.
-            if consecutive_failures >= self.MAX_FAST_RETRIES:
-                cooldown = min(
-                    self.BACKOFF_COOLDOWN_SECS * (2 ** (consecutive_failures - self.MAX_FAST_RETRIES)),
-                    self.MAX_BACKOFF_SECS,
-                )
-                logger.warning(
-                    f"Connection failed {consecutive_failures} times in a row. "
-                    f"Waiting {cooldown:.0f}s before next attempt."
-                )
-                self._emit_status(f"BLE: retrying in {cooldown:.0f}s")
-                pre_backoff = time.time()
-                await asyncio.sleep(cooldown)
-                backoff_wall = time.time() - pre_backoff
-                if backoff_wall > cooldown + self.SLEEP_DETECTION_SECS:
-                    logger.info(
-                        f"Sleep detected during backoff "
-                        f"(wall {backoff_wall:.1f}s for {cooldown:.0f}s wait)"
-                    )
-                    just_woke = True
-                    continue
-
-            # --- Discover (use longer scan after failures) ---
-            logger.info("Starting BLE device scan")
-            self._emit_status("BLE: scanning")
-            scan_timeout = 8.0 if consecutive_failures > 0 else 5.0
-            pre_scan = time.time()
-            device = await self._discover_device(scan_timeout=scan_timeout)
-            scan_wall = time.time() - pre_scan
-
-            # If the scan took far longer than expected, the system slept.
-            if scan_wall > scan_timeout + self.SLEEP_DETECTION_SECS:
-                logger.info(
-                    f"Sleep detected during scan "
-                    f"(wall {scan_wall:.1f}s for {scan_timeout}s scan)"
-                )
-                just_woke = True
-                continue
-
-            if device is None:
-                logger.warning("No matching BLE device found")
-                self._emit_status("BLE: not found")
-                consecutive_failures += 1
-                await asyncio.sleep(2)
-                continue
-
-            # --- Connect (without async-with so we control disconnect) ---
-            client = BleakClient(
-                device, disconnected_callback=self._on_ble_disconnected
+            process = mp.Process(
+                target=run_ble_worker,
+                args=(
+                    event_queue,
+                    mp_stop,
+                    self._service_uuid,
+                    self._char_uuid,
+                    self._device_name,
+                ),
+                daemon=True,
             )
-            self._disconnected_event = asyncio.Event()
-            pre_connect = time.time()
+            process.start()
+            logger.info("BLE subprocess started (pid=%d)", process.pid)
+            self._emit_status("BLE: subprocess started")
 
             try:
-                logger.info(f"Connecting to {device.name or device.address}")
-                self._emit_status(f"BLE: connecting to {device.name or device.address}")
-                await asyncio.wait_for(client.connect(), timeout=10.0)
-
-                logger.info(f"Connected to {device.name or device.address}")
-                self._emit_status("BLE: connected")
-                self._emit_connected(True)
-                consecutive_failures = 0  # Reset on successful connection
-
-                # Subscribe to notifications
-                await client.start_notify(self._char_uuid, self._handle_notification)
-                logger.info("Subscribed to BLE notifications")
-
-                # Read the initial blocking state
-                try:
-                    initial_value = await asyncio.wait_for(
-                        client.read_gatt_char(self._char_uuid),
-                        timeout=self.GATT_READ_TIMEOUT_SECS,
-                    )
-                    logger.info(f"Initial characteristic value: {initial_value.hex()}")
-                    initial_blocking = self._parse_payload(initial_value)
-                    if initial_blocking is not None:
-                        logger.info(f"Initial blocking state: {initial_blocking}")
-                        await self._on_toggle(initial_blocking)
-                except Exception as e:
-                    logger.warning(f"Failed to read initial value: {e}")
-
-                # --- Stay-connected loop ---
-                last_health_check = time.time()
-
-                while not self._stop_event.is_set():
-                    # 1. Check bleak's disconnected callback
-                    if self._disconnected_event.is_set():
-                        logger.info("Disconnected event set, breaking connection loop")
-                        break
-
-                    # 2. Wall-clock sleep detection
-                    wall_before = time.time()
-                    await asyncio.sleep(1)
-                    wall_after = time.time()
-                    elapsed = wall_after - wall_before
-
-                    if elapsed > self.SLEEP_DETECTION_SECS:
-                        logger.info(
-                            f"System sleep detected (asyncio.sleep(1) took "
-                            f"{elapsed:.1f}s). Forcing reconnection."
-                        )
-                        just_woke = True
-                        break
-
-                    # 3. Check is_connected (may go False on its own)
-                    if not client.is_connected:
-                        logger.info("client.is_connected is False, breaking")
-                        break
-
-                    # 4. Periodic GATT read health-check + state sync
-                    if wall_after - last_health_check >= self.HEALTH_CHECK_INTERVAL_SECS:
-                        try:
-                            logger.debug("Health check: reading characteristic")
-                            value = await asyncio.wait_for(
-                                client.read_gatt_char(self._char_uuid),
-                                timeout=self.GATT_READ_TIMEOUT_SECS,
-                            )
-                            logger.debug(f"Health check OK: {value.hex()}")
-                            blocking = self._parse_payload(value)
-                            if blocking is not None:
-                                await self._on_toggle(blocking)
-                            last_health_check = wall_after
-                        except Exception as e:
-                            logger.warning(f"Health check failed: {e}")
-                            break
-
-            except asyncio.TimeoutError:
-                connect_wall = time.time() - pre_connect
-                if connect_wall > 10 + self.SLEEP_DETECTION_SECS:
-                    logger.info(
-                        f"Sleep detected during connect "
-                        f"(wall {connect_wall:.1f}s for 10s timeout)"
-                    )
-                    just_woke = True
-                else:
-                    consecutive_failures += 1
-                    logger.error(
-                        f"BLE connect/setup timed out "
-                        f"(failure {consecutive_failures})"
-                    )
-            except Exception as e:
-                connect_wall = time.time() - pre_connect
-                if connect_wall > 15:
-                    logger.info(
-                        f"Sleep likely occurred during connection error "
-                        f"(wall {connect_wall:.1f}s)"
-                    )
-                    just_woke = True
-                else:
-                    consecutive_failures += 1
-                    logger.error(
-                        f"BLE connection error (failure {consecutive_failures}): {e}",
-                        exc_info=True,
-                    )
-            finally:
-                await self._safe_disconnect(client)
-                self._emit_status("BLE: disconnected")
-                self._emit_connected(False)
-                logger.info("BLE connection closed, will retry")
-
-            if not just_woke and consecutive_failures < self.MAX_FAST_RETRIES:
-                await asyncio.sleep(1)
-
-    async def _discover_device(self, scan_timeout: float = 5.0):
-        logger.info(f"Discovering BLE devices (timeout={scan_timeout}s)...")
-        discovery = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
-        logger.info(f"Found {len(discovery)} BLE devices")
-
-        for i, (address, (device, adv)) in enumerate(discovery.items()):
-            name = adv.local_name or device.name or "Unknown"
-            service_uuids = [u.lower() for u in adv.service_uuids]
-            logger.info(
-                f"  Device {i+1}/{len(discovery)}: {name} ({address}), "
-                f"RSSI: {adv.rssi}, Service UUIDs: {service_uuids}"
-            )
-
-        self._emit_devices(list(discovery.values()))
-
-        for address, (device, adv) in discovery.items():
-            name = adv.local_name or device.name
-            if self._device_name and name != self._device_name:
-                logger.debug(f"Skipping device {name or address} (name mismatch)")
-                continue
-            service_uuids = [u.lower() for u in adv.service_uuids]
-            if self._service_uuid in service_uuids:
-                logger.info(
-                    f"Found matching device: {name or address} "
-                    f"with service UUID {self._service_uuid}"
+                await self._consume_events(event_queue, process)
+            except Exception as exc:
+                logger.error(
+                    "Error in subprocess event loop: %s", exc, exc_info=True,
                 )
-                return device
+            finally:
+                mp_stop.set()
+                process.join(timeout=5)
+                if process.is_alive():
+                    logger.warning("Killing unresponsive BLE subprocess")
+                    process.kill()
+                    process.join(timeout=2)
+                logger.info("BLE subprocess terminated")
+                self._mp_stop = None
+                self._emit_connected(False)
 
-        logger.warning(f"No device found advertising service UUID {self._service_uuid}")
-        return None
+            if self._stop_event.is_set():
+                break
 
-    def _emit_devices(self, device_adv_pairs) -> None:
-        if self._on_devices is None:
-            logger.debug("No on_devices callback registered")
-            return
-        names = []
-        for device, adv in device_adv_pairs:
-            label = adv.local_name or device.name or device.address
-            if adv.rssi is not None:
-                label = f"{label} (RSSI {adv.rssi})"
-            if adv.service_uuids:
-                label = f"{label}  services: {adv.service_uuids}"
-            names.append(label)
-        logger.info(f"Emitting {len(names)} devices to callback")
-        self._on_devices(names)
+            logger.info(
+                "Restarting BLE subprocess in 3s (fresh CoreBluetooth context)"
+            )
+            self._emit_status("BLE: restarting")
+            await asyncio.sleep(3)
 
-    def _handle_notification(self, _sender, data: bytearray) -> None:
-        logger.info(f"Received BLE notification: {data.hex()}")
-        blocking = self._parse_payload(data)
-        if blocking is None:
-            logger.warning(f"Could not parse notification payload: {data}")
-            return
-        logger.info(f"Parsed blocking state: {blocking}")
-        asyncio.create_task(self._on_toggle(blocking))
+    async def _consume_events(
+        self, event_queue: mp.Queue, process: mp.Process,
+    ) -> None:
+        """Read events from the BLE subprocess and dispatch them."""
+        loop = asyncio.get_event_loop()
+
+        while process.is_alive() and not self._stop_event.is_set():
+            try:
+                event = await loop.run_in_executor(
+                    None, lambda: event_queue.get(timeout=1.0),
+                )
+            except queue.Empty:
+                continue
+
+            etype = event.get("type")
+
+            if etype == "status":
+                self._emit_status(f"BLE: {event['status']}")
+
+            elif etype == "connected":
+                self._emit_connected(event["connected"])
+
+            elif etype == "devices":
+                if self._on_devices is not None:
+                    self._on_devices(event["devices"])
+
+            elif etype in ("notification", "value"):
+                data = bytearray(event["data"])
+                blocking = self._parse_payload(data)
+                if blocking is not None:
+                    logger.info(
+                        "BLE toggle from subprocess: blocking=%s", blocking,
+                    )
+                    await self._on_toggle(blocking)
+
+            elif etype == "exit":
+                logger.info(
+                    "BLE subprocess requested exit: %s",
+                    event.get("reason", "unknown"),
+                )
+                return
+
+    # ------------------------------------------------------------------
+    # Helpers (unchanged interface for LocalWebSocketServer / UI)
+    # ------------------------------------------------------------------
 
     def _emit_status(self, status: str) -> None:
         if self._on_status is not None:
