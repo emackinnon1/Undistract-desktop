@@ -139,7 +139,7 @@ def run_ble_worker(
                 name = adv.local_name or dev.name
                 if device_name and name != device_name:
                     continue
-                svc_uuids = [u.lower() for u in adv.service_uuids]
+                svc_uuids = [u.lower() for u in (adv.service_uuids or [])]
                 if service_uuid.lower() in svc_uuids:
                     logger.info("Found target: %s (%s)", name, dev.address)
                     target = dev
