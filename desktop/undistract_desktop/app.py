@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
+import multiprocessing as mp
 import threading
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
@@ -25,7 +27,23 @@ from PyQt6.QtWidgets import (
 from .blocklist_store import BlocklistStore
 from .websocket_server import LocalWebSocketServer
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Set up logging to file so we can diagnose issues in the bundled app
+_log_dir = Path.home() / "Library" / "Logs" / "Undistract"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_log_file = _log_dir / "undistract.log"
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    _log_file, maxBytes=2 * 1024 * 1024, backupCount=3,
+)
+_file_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), _file_handler],
+)
 
 logger = logging.getLogger(__name__)
 class UiSignals(QObject):
@@ -35,7 +53,7 @@ class UiSignals(QObject):
 
 
 class MainWindow(QWidget):
-    def __init__(self, icon_path: Path) -> None:
+    def __init__(self, icon_path: Path, log_queue: Optional[mp.Queue] = None) -> None:
         super().__init__()
         self.setWindowTitle("Undistract Desktop")
         self._icon = QIcon(str(icon_path))
@@ -51,6 +69,7 @@ class MainWindow(QWidget):
             on_ble_status=self._signals.ble_status_changed.emit,
             on_ble_devices=self._signals.ble_devices_changed.emit,
             on_blocking_changed=self._signals.blocking_changed.emit,
+            log_queue=log_queue,
         )
         self._server_thread = threading.Thread(target=self._server.run_forever, daemon=True)
         self._server_thread.start()
@@ -215,6 +234,16 @@ class MainWindow(QWidget):
 
 
 def main() -> None:
+    # --- Centralised log queue for BLE subprocess ------------------
+    # The BLE worker sends log records through this queue; the
+    # QueueListener dispatches them to _file_handler in *this* process
+    # so that RotatingFileHandler rotation is safe.
+    log_queue: mp.Queue = mp.Queue()
+    log_listener = logging.handlers.QueueListener(
+        log_queue, _file_handler, respect_handler_level=True,
+    )
+    log_listener.start()
+
     app = QApplication([])
     
     # Resolve icon path relative to repo root
@@ -225,11 +254,13 @@ def main() -> None:
     # Keep app running when all windows are closed (tray mode)
     app.setQuitOnLastWindowClosed(False)
     
-    window = MainWindow(icon_path)
+    window = MainWindow(icon_path, log_queue=log_queue)
     window.setup_tray_icon()
     window.resize(520, 480)
     window.show()
     app.exec()
+
+    log_listener.stop()
 
 
 if __name__ == "__main__":

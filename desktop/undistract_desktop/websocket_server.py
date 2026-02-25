@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import platform
+import multiprocessing as mp
+import multiprocessing.synchronize
+import queue
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
@@ -11,21 +13,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .blocklist_store import BlocklistStore
-from bleak import BleakClient, BleakScanner
-
-# macOS sleep/wake event handling
-if platform.system() == "Darwin":
-    try:
-        from Foundation import NSObject, NSWorkspace
-        from Cocoa import (
-            NSWorkspaceWillSleepNotification,
-            NSWorkspaceDidWakeNotification,
-        )
-        MACOS_SLEEP_WAKE_AVAILABLE = True
-    except ImportError:
-        MACOS_SLEEP_WAKE_AVAILABLE = False
-else:
-    MACOS_SLEEP_WAKE_AVAILABLE = False
+from .ble_worker import run_ble_worker
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +28,13 @@ class ClientState:
 
 
 class BleToggleClient:
+    """Manages BLE connection to the mobile app via a child subprocess.
+
+    Running BLE in a separate process ensures each restart gets a
+    completely fresh CoreBluetooth context — the only reliable way to
+    recover from macOS sleep/wake BLE connection issues.
+    """
+
     def __init__(
         self,
         on_toggle,
@@ -49,6 +44,7 @@ class BleToggleClient:
         on_status: Optional[Callable[[str], None]] = None,
         on_devices: Optional[Callable[[List[str]], None]] = None,
         on_connected: Optional[Callable[[bool], None]] = None,
+        log_queue: Optional[mp.Queue] = None,
     ) -> None:
         self._on_toggle = on_toggle
         self._service_uuid = service_uuid.lower()
@@ -58,187 +54,122 @@ class BleToggleClient:
         self._on_devices = on_devices
         self._on_connected = on_connected
         self._stop_event = asyncio.Event()
-        self._wake_event = asyncio.Event()
-        self._sleep_wake_observer = None
-        
-        # Set up macOS sleep/wake notifications
-        if MACOS_SLEEP_WAKE_AVAILABLE:
-            self._setup_sleep_wake_observer()
+        self._mp_stop: Optional[multiprocessing.synchronize.Event] = None
+        self._log_queue = log_queue
 
-    def _setup_sleep_wake_observer(self) -> None:
-        """Set up macOS sleep/wake event observer."""
-        try:
-            class SleepWakeObserver(NSObject):
-                def init_with_client(self, client):
-                    self = self.init()
-                    if self:
-                        self.client = client
-                    return self
-                
-                def computer_will_sleep_(self, notification):
-                    logger.info("macOS: Computer going to sleep")
-                    # No async action needed here, just log
-                
-                def computer_did_wake_(self, notification):
-                    logger.info("macOS: Computer woke from sleep")
-                    # Signal the BLE client to force reconnection
-                    self.client._wake_event.set()
-            
-            self._sleep_wake_observer = SleepWakeObserver.alloc().init_with_client(self)
-            workspace = NSWorkspace.sharedWorkspace()
-            nc = workspace.notificationCenter()
-            
-            nc.addObserver_selector_name_object_(
-                self._sleep_wake_observer,
-                "computer_will_sleep:",
-                NSWorkspaceWillSleepNotification,
-                None
-            )
-            nc.addObserver_selector_name_object_(
-                self._sleep_wake_observer,
-                "computer_did_wake:",
-                NSWorkspaceDidWakeNotification,
-                None
-            )
-            logger.info("macOS sleep/wake observer registered")
-        except Exception as e:
-            logger.warning(f"Failed to set up sleep/wake observer: {e}")
-    
     async def stop(self) -> None:
         self._stop_event.set()
-        if MACOS_SLEEP_WAKE_AVAILABLE and self._sleep_wake_observer:
-            try:
-                workspace = NSWorkspace.sharedWorkspace()
-                nc = workspace.notificationCenter()
-                nc.removeObserver_(self._sleep_wake_observer)
-            except Exception as e:
-                logger.warning(f"Failed to remove sleep/wake observer: {e}")
+        if self._mp_stop is not None:
+            self._mp_stop.set()
+
+    # ------------------------------------------------------------------
+    # Subprocess lifecycle
+    # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        logger.info("BLE client starting")
+        """Spawn and supervise a BLE worker subprocess.
+
+        When the subprocess exits (sleep detected, CoreBluetooth stuck,
+        or normal disconnect), a fresh subprocess is spawned — giving it
+        a clean CoreBluetooth context identical to an app restart.
+        """
+        logger.info("BLE client starting (subprocess mode)")
+
         while not self._stop_event.is_set():
-            logger.info("Starting BLE device scan")
-            self._emit_status("BLE: scanning")
-            device = await self._discover_device()
-            if device is None:
-                logger.warning("No matching BLE device found")
-                self._emit_status("BLE: not found")
-                await asyncio.sleep(1)
-                continue
-            try:
-                logger.info(f"Attempting to connect to BLE device: {device.name or device.address}")
-                self._emit_status(f"BLE: connecting to {device.name or device.address}")
-                async with BleakClient(device) as client:
-                    logger.info(f"Successfully connected to {device.name or device.address}")
-                    logger.info(f"Subscribing to characteristic {self._char_uuid}")
-                    self._emit_status("BLE: connected")
-                    self._emit_connected(True)
-                    await client.start_notify(self._char_uuid, self._handle_notification)
-                    logger.info("Subscribed to notifications")
-                    
-                    # Read the initial blocking state
-                    try:
-                        initial_value = await client.read_gatt_char(self._char_uuid)
-                        logger.info(f"Read initial characteristic value: {initial_value.hex()}")
-                        initial_blocking = self._parse_payload(initial_value)
-                        if initial_blocking is not None:
-                            logger.info(f"Initial blocking state: {initial_blocking}")
-                            await self._on_toggle(initial_blocking)
-                    except Exception as e:
-                        logger.warning(f"Failed to read initial characteristic value: {e}")
-                    
-                    # Periodic health check to detect stale connections (e.g., after sleep)
-                    health_check_interval = 10  # seconds (reduced for faster detection)
-                    last_health_check = asyncio.get_event_loop().time()
-                    
-                    while client.is_connected and not self._stop_event.is_set():
-                        # Check if system just woke up
-                        if self._wake_event.is_set():
-                            logger.info("Wake event detected, forcing reconnection")
-                            self._wake_event.clear()
-                            raise Exception("System wake - forcing reconnection")
-                        
-                        await asyncio.sleep(1)
-                        
-                        # Perform periodic health check by reading the characteristic
-                        current_time = asyncio.get_event_loop().time()
-                        if current_time - last_health_check >= health_check_interval:
-                            try:
-                                logger.debug("Performing BLE connection health check")
-                                # Try to read with a timeout to detect stale connections
-                                value = await asyncio.wait_for(
-                                    client.read_gatt_char(self._char_uuid),
-                                    timeout=5.0
-                                )
-                                logger.debug(f"Health check successful, value: {value.hex()}")
-                                last_health_check = current_time
-                            except asyncio.TimeoutError:
-                                logger.warning("Health check timed out, connection may be stale")
-                                raise  # This will cause reconnection
-                            except Exception as e:
-                                logger.warning(f"Health check failed: {e}")
-                                raise  # This will cause reconnection
-            except Exception as e:
-                logger.error(f"BLE connection error: {e}", exc_info=True)
-                self._emit_status("BLE: disconnected")
-                self._emit_connected(False)
-                # Shorter retry delay for faster recovery after sleep/wake
-                await asyncio.sleep(1)
+            event_queue: mp.Queue = mp.Queue()
+            mp_stop = mp.Event()
+            self._mp_stop = mp_stop
 
-    async def _discover_device(self):
-        logger.info("Discovering BLE devices...")
-        discovery = await BleakScanner.discover(timeout=4.0, return_adv=True)
-        logger.info(f"Found {len(discovery)} BLE devices")
-
-        for i, (address, (device, adv)) in enumerate(discovery.items()):
-            name = adv.local_name or device.name or "Unknown"
-            service_uuids = [u.lower() for u in adv.service_uuids]
-            logger.info(
-                f"  Device {i+1}/{len(discovery)}: {name} ({address}), "
-                f"RSSI: {adv.rssi}, Service UUIDs: {service_uuids}"
+            process = mp.Process(
+                target=run_ble_worker,
+                args=(
+                    event_queue,
+                    mp_stop,
+                    self._log_queue,
+                    self._service_uuid,
+                    self._char_uuid,
+                    self._device_name,
+                ),
+                daemon=True,
             )
+            process.start()
+            logger.info("BLE subprocess started (pid=%d)", process.pid)
+            self._emit_status("BLE: subprocess started")
 
-        self._emit_devices(list(discovery.values()))
-
-        for address, (device, adv) in discovery.items():
-            name = adv.local_name or device.name
-            if self._device_name and name != self._device_name:
-                logger.debug(f"Skipping device {name or address} (name mismatch)")
-                continue
-            service_uuids = [u.lower() for u in adv.service_uuids]
-            if self._service_uuid in service_uuids:
-                logger.info(
-                    f"Found matching device: {name or address} "
-                    f"with service UUID {self._service_uuid}"
+            try:
+                await self._consume_events(event_queue, process)
+            except Exception as exc:
+                logger.error(
+                    "Error in subprocess event loop: %s", exc, exc_info=True,
                 )
-                return device
+            finally:
+                mp_stop.set()
+                process.join(timeout=5)
+                if process.is_alive():
+                    logger.warning("Killing unresponsive BLE subprocess")
+                    process.kill()
+                    process.join(timeout=2)
+                logger.info("BLE subprocess terminated")
+                # Ensure the multiprocessing.Queue is properly cleaned up
+                event_queue.close()
+                event_queue.join_thread()
+                self._mp_stop = None
+                self._emit_connected(False)
 
-        logger.warning(f"No device found advertising service UUID {self._service_uuid}")
-        return None
+            if self._stop_event.is_set():
+                break
 
-    def _emit_devices(self, device_adv_pairs) -> None:
-        if self._on_devices is None:
-            logger.debug("No on_devices callback registered")
-            return
-        names = []
-        for device, adv in device_adv_pairs:
-            label = adv.local_name or device.name or device.address
-            if adv.rssi is not None:
-                label = f"{label} (RSSI {adv.rssi})"
-            if adv.service_uuids:
-                label = f"{label}  services: {adv.service_uuids}"
-            names.append(label)
-        logger.info(f"Emitting {len(names)} devices to callback")
-        self._on_devices(names)
+            logger.info(
+                "Restarting BLE subprocess in 3s (fresh CoreBluetooth context)"
+            )
+            self._emit_status("BLE: restarting")
+            await asyncio.sleep(3)
 
-    def _handle_notification(self, _sender, data: bytearray) -> None:
-        logger.info(f"Received BLE notification: {data.hex()}")
-        blocking = self._parse_payload(data)
-        if blocking is None:
-            logger.warning(f"Could not parse notification payload: {data}")
-            return
-        logger.info(f"Parsed blocking state: {blocking}")
-        asyncio.create_task(self._on_toggle(blocking))
+    async def _consume_events(
+        self, event_queue: mp.Queue, process: mp.Process,
+    ) -> None:
+        """Read events from the BLE subprocess and dispatch them."""
+        loop = asyncio.get_event_loop()
+
+        while process.is_alive() and not self._stop_event.is_set():
+            try:
+                event = await loop.run_in_executor(
+                    None, lambda: event_queue.get(timeout=1.0),
+                )
+            except queue.Empty:
+                continue
+
+            etype = event.get("type")
+
+            if etype == "status":
+                self._emit_status(f"BLE: {event['status']}")
+
+            elif etype == "connected":
+                self._emit_connected(event["connected"])
+
+            elif etype == "devices":
+                if self._on_devices is not None:
+                    self._on_devices(event["devices"])
+
+            elif etype in ("notification", "value"):
+                data = bytearray(event["data"])
+                blocking = self._parse_payload(data)
+                if blocking is not None:
+                    logger.info(
+                        "BLE toggle from subprocess: blocking=%s", blocking,
+                    )
+                    await self._on_toggle(blocking)
+
+            elif etype == "exit":
+                logger.info(
+                    "BLE subprocess requested exit: %s",
+                    event.get("reason", "unknown"),
+                )
+                return
+
+    # ------------------------------------------------------------------
+    # Helpers (unchanged interface for LocalWebSocketServer / UI)
+    # ------------------------------------------------------------------
 
     def _emit_status(self, status: str) -> None:
         if self._on_status is not None:
@@ -285,6 +216,7 @@ class LocalWebSocketServer:
         on_ble_devices: Optional[Callable[[List[str]], None]] = None,
         on_ble_connected: Optional[Callable[[bool], None]] = None,
         on_blocking_changed: Optional[Callable[[bool], None]] = None,
+        log_queue: Optional[mp.Queue] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -295,6 +227,7 @@ class LocalWebSocketServer:
         self._ble_task: Optional[asyncio.Task] = None
         self._ble_client = None
         self._on_blocking_changed = on_blocking_changed
+        self._ble_controlled = False  # True when the phone activated blocking
         if enable_ble:
             self._ble_client = BleToggleClient(
                 self._handle_ble_toggle,
@@ -304,6 +237,7 @@ class LocalWebSocketServer:
                 on_status=on_ble_status,
                 on_devices=on_ble_devices,
                 on_connected=on_ble_connected,
+                log_queue=log_queue,
             )
 
     async def _handler(self, ws: WebSocketServerProtocol) -> None:
@@ -344,7 +278,19 @@ class LocalWebSocketServer:
             await ws.send(json.dumps({"type": "error", "message": "unknown_message"}))
 
     async def _handle_ble_toggle(self, blocking: bool) -> None:
-        logger.info(f"BLE toggled blocking state to: {blocking}")
+        logger.info(f"BLE reports blocking={blocking}, ble_controlled={self._ble_controlled}")
+
+        if blocking:
+            # Phone is activating blocking – always honour this.
+            self._ble_controlled = True
+        else:
+            # Phone says "not blocking".  Only release if the phone was the
+            # one that activated blocking; otherwise noop.
+            if not self._ble_controlled:
+                logger.info("BLE blocking=False ignored (phone did not set blocking)")
+                return
+            self._ble_controlled = False
+
         state = self._store.set_blocking(blocking)
         await self._broadcast(self._state_payload(state))
         if self._on_blocking_changed is not None:
