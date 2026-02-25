@@ -107,6 +107,9 @@ class BleToggleClient:
                     process.kill()
                     process.join(timeout=2)
                 logger.info("BLE subprocess terminated")
+                # Ensure the multiprocessing.Queue is properly cleaned up
+                event_queue.close()
+                event_queue.join_thread()
                 self._mp_stop = None
                 self._emit_connected(False)
 
