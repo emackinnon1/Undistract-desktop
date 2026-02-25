@@ -22,7 +22,6 @@ import os
 import time
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
-from pathlib import Path
 from typing import Optional
 
 
@@ -53,6 +52,7 @@ def _emit(q: Queue, event: dict) -> None:
 def run_ble_worker(
     event_queue: Queue,
     stop_event: MpEvent,
+    log_queue: Optional[Queue],
     service_uuid: str,
     char_uuid: str,
     device_name: Optional[str],
@@ -66,18 +66,16 @@ def run_ble_worker(
     * ``stop_event`` is set by the parent.
     """
     # ---- logging (subprocess) ----
-    log_dir = Path.home() / "Library" / "Logs" / "Undistract"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "undistract.log"
-
-    fh = logging.FileHandler(log_file)
-    fh.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    )
+    # All file I/O (including rotation) is centralised in the parent
+    # process via QueueHandler → QueueListener.  The subprocess only
+    # writes to stderr directly.
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_queue is not None:
+        handlers.append(logging.handlers.QueueHandler(log_queue))
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(), fh],
+        handlers=handlers,
         force=True,
     )
     logger = logging.getLogger("ble_worker")

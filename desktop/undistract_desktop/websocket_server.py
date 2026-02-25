@@ -44,6 +44,7 @@ class BleToggleClient:
         on_status: Optional[Callable[[str], None]] = None,
         on_devices: Optional[Callable[[List[str]], None]] = None,
         on_connected: Optional[Callable[[bool], None]] = None,
+        log_queue: Optional[mp.Queue] = None,
     ) -> None:
         self._on_toggle = on_toggle
         self._service_uuid = service_uuid.lower()
@@ -54,6 +55,7 @@ class BleToggleClient:
         self._on_connected = on_connected
         self._stop_event = asyncio.Event()
         self._mp_stop: Optional[multiprocessing.synchronize.Event] = None
+        self._log_queue = log_queue
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -83,6 +85,7 @@ class BleToggleClient:
                 args=(
                     event_queue,
                     mp_stop,
+                    self._log_queue,
                     self._service_uuid,
                     self._char_uuid,
                     self._device_name,
@@ -213,6 +216,7 @@ class LocalWebSocketServer:
         on_ble_devices: Optional[Callable[[List[str]], None]] = None,
         on_ble_connected: Optional[Callable[[bool], None]] = None,
         on_blocking_changed: Optional[Callable[[bool], None]] = None,
+        log_queue: Optional[mp.Queue] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -233,6 +237,7 @@ class LocalWebSocketServer:
                 on_status=on_ble_status,
                 on_devices=on_ble_devices,
                 on_connected=on_ble_connected,
+                log_queue=log_queue,
             )
 
     async def _handler(self, ws: WebSocketServerProtocol) -> None:
