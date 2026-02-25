@@ -10,7 +10,7 @@ Event types emitted → parent:
     {"type": "connected",    "connected": true|false}
     {"type": "devices",      "devices": ["label", ...]}
     {"type": "notification", "data": [int, ...]}
-    {"type": "value",        "data": [int, ...]}
+    {"type": "value",        "data": [int, ...]}   # only on connect or when value changes
     {"type": "exit",         "reason": "<text>"}
 """
 from __future__ import annotations
@@ -216,13 +216,15 @@ def run_ble_worker(
                 logger.info("Subscribed to BLE notifications")
 
                 # Read initial characteristic value
+                last_value: Optional[list] = None
                 try:
                     initial = await asyncio.wait_for(
                         client.read_gatt_char(char_uuid),
                         timeout=GATT_READ_TIMEOUT_SECS,
                     )
                     logger.info("Initial value: %s", initial.hex())
-                    emit({"type": "value", "data": list(initial)})
+                    last_value = list(initial)
+                    emit({"type": "value", "data": last_value})
                 except Exception as exc:
                     logger.warning("Initial read failed: %s", exc)
 
@@ -257,7 +259,14 @@ def run_ble_worker(
                                 timeout=GATT_READ_TIMEOUT_SECS,
                             )
                             logger.debug("Health check OK: %s", value.hex())
-                            emit({"type": "value", "data": list(value)})
+                            current = list(value)
+                            if current != last_value:
+                                logger.info(
+                                    "BLE value changed: %s -> %s",
+                                    last_value, current,
+                                )
+                                last_value = current
+                                emit({"type": "value", "data": current})
                             last_health = wall_after
                         except Exception as exc:
                             logger.warning("Health check failed: %s", exc)
