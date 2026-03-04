@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DESKTOP_DIR="$REPO_DIR/desktop"
-ICON_PATH="$REPO_DIR/Undistract-logo.png"
+ICON_PATH="$REPO_DIR/logo.png"
 
 echo "Building Undistract.app with PyInstaller..."
 

@@ -68,7 +68,7 @@ Add some domains to the blocklist and toggle "Blocking enabled".
 
 The app features:
 - **System tray icon**: Click to show/hide the window, access blocking toggle, or quit
-- **App icon**: Uses Undistract-logo.png from the repo root
+- **App icon**: Uses logo.png from the repo root
 - **Background mode**: Closing the window hides it to the tray instead of quitting
 - **BLE device scanning**: Lists nearby Bluetooth devices for future integration
 - **Proper macOS integration**: Shows "Undistract" in the menu bar (not "python3.13")

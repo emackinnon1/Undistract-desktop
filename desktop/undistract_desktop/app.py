@@ -247,7 +247,7 @@ def main() -> None:
     app = QApplication([])
     
     # Resolve icon path relative to repo root
-    icon_path = Path(__file__).resolve().parents[2] / "Undistract-logo.png"
+    icon_path = Path(__file__).resolve().parents[2] / "logo.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     
